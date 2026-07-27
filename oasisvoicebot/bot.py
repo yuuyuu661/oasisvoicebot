@@ -129,8 +129,66 @@ def build_bot(settings: Settings) -> OasisVoiceBot:
             ephemeral=True,
         )
 
+    provider_choices = [
+        app_commands.Choice(
+            name="VOICEVOX",
+            value="voicevox",
+        )
+    ]
+    if "clone" in bot.providers:
+        provider_choices.append(
+            app_commands.Choice(
+                name="録音サンプル音声",
+                value="clone",
+            )
+        )
+
+    async def voice_autocomplete(
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        provider = getattr(interaction.namespace, "provider", None)
+        current_lower = current.lower()
+
+        if provider == "voicevox":
+            try:
+                speakers = await bot.providers["voicevox"].voices()
+            except Exception:
+                logger.exception("VOICEVOX音声候補の取得に失敗")
+                return []
+
+            choices: list[app_commands.Choice[str]] = []
+            for speaker in speakers:
+                for style in speaker.get("styles", []):
+                    label = f"{speaker['name']} / {style['name']}"
+                    if current_lower and current_lower not in label.lower():
+                        continue
+                    choices.append(
+                        app_commands.Choice(
+                            name=label[:100],
+                            value=str(style["id"]),
+                        )
+                    )
+                    if len(choices) == 25:
+                        return choices
+            return choices
+
+        if provider == "clone":
+            return [
+                app_commands.Choice(name=name[:100], value=name)
+                for name in settings.clone_voices
+                if not current_lower or current_lower in name.lower()
+            ][:25]
+
+        return []
+
     @bot.tree.command(name="voice", description="読み上げ音声を変更")
-    @app_commands.describe(provider="voicevox または clone", voice="VOICEVOXのスタイルID、またはクローン音声名")
+    @app_commands.describe(
+        provider="音声エンジンを選択",
+        voice="選択したエンジンの音声を選択",
+    )
+    @app_commands.choices(provider=provider_choices)
+    @app_commands.autocomplete(voice=voice_autocomplete)
     async def voice(interaction: discord.Interaction, provider: str, voice: str) -> None:
         if not interaction.guild:
             return
@@ -186,4 +244,3 @@ def run() -> None:
     settings = Settings.from_env()
     bot = build_bot(settings)
     asyncio.run(bot.start(settings.discord_token))
-

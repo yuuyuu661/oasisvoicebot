@@ -9,7 +9,7 @@ Discordのテキスト投稿をVOICEVOXで音声合成し、ボイスチャン�
 - `/join` を実行したテキストチャンネルの投稿を読み上げ
 - `/leave`、`/skip`
 - `/voices` でVOICEVOXの話者・スタイルIDを確認
-- `/voice voicevox 3` のように音声を変更
+- `/voice` のProviderと音声をプルダウンから選んで変更
 - URL省略、絵文字除去、長文制限、30件の再生キュー
 - Railway用のDockerfileと`/health`エンドポイント
 - 後付け音声クローン用HTTPインターフェース
@@ -89,7 +89,8 @@ CLONE_TTS_API_KEY=...
 CLONE_VOICES_JSON={"yuuyuu":"voice-model-id"}
 ```
 
-Discordでは `/voice clone yuuyuu` で切り替えます。学習・生成サービスはBotとは
+Discordでは `/voice` のProviderで「録音サンプル音声」を選び、音声欄から
+`yuuyuu`を選択して切り替えます。学習・生成サービスはBotとは
 別リポジトリ／別Railwayサービスにするのがおすすめです。録音データは本人が同意した
 用途・保存期間・アクセス範囲に限定し、公開リポジトリへ置かないでください。
 
