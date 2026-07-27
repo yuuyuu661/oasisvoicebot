@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass
 
@@ -47,7 +48,7 @@ class OasisVoiceBot(commands.Bot):
         logger.info("health server started on port %s", self.settings.port)
 
     async def close(self) -> None:
-        for player in self.players.values():
+        for player in list(self.players.values()):
             await player.close()
         if hasattr(self, "health_server"):
             self.health_server.close()
@@ -61,6 +62,102 @@ class OasisVoiceBot(commands.Bot):
 
     def player_for(self, guild_id: int) -> GuildPlayer:
         return self.players.setdefault(guild_id, GuildPlayer(guild_id))
+
+    async def stop_guild(self, guild_id: int) -> None:
+        player = self.players.pop(guild_id, None)
+        self.states.pop(guild_id, None)
+        if player:
+            await player.close()
+
+
+VoiceChannel = discord.VoiceChannel | discord.StageChannel
+
+
+class JoinConfirmationView(discord.ui.View):
+    def __init__(
+        self,
+        bot: OasisVoiceBot,
+        requester_id: int,
+        guild_id: int,
+        target_channel: VoiceChannel,
+        text_channel_id: int,
+    ) -> None:
+        super().__init__(timeout=60)
+        self.bot = bot
+        self.requester_id = requester_id
+        self.guild_id = guild_id
+        self.target_channel = target_channel
+        self.text_channel_id = text_channel_id
+        self.message: discord.InteractionMessage | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.requester_id:
+            return True
+        await interaction.response.send_message(
+            "この確認を操作できるのは `/join` を実行したユーザーだけです。",
+            ephemeral=True,
+        )
+        return False
+
+    def disable_buttons(self) -> None:
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+
+    @discord.ui.button(label="接続", style=discord.ButtonStyle.primary)
+    async def connect(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        if not guild or guild.id != self.guild_id:
+            await interaction.followup.send("接続先のサーバーを確認できません。", ephemeral=True)
+            return
+
+        self.disable_buttons()
+        if interaction.message:
+            await interaction.message.edit(view=self)
+
+        try:
+            await self.bot.stop_guild(guild.id)
+            voice_client = await self.target_channel.connect()
+        except Exception as exc:
+            logger.exception("確認後のボイスチャンネル接続に失敗")
+            await interaction.followup.send(
+                f"ボイスチャンネルへ接続できませんでした: {type(exc).__name__}",
+                ephemeral=True,
+            )
+            self.stop()
+            return
+
+        self.bot.player_for(guild.id).attach(voice_client)
+        self.bot.state_for(guild.id).text_channel_id = self.text_channel_id
+        await interaction.followup.send(
+            f"{self.target_channel.mention} に接続先を変更しました。",
+            ephemeral=True,
+        )
+        self.stop()
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        self.disable_buttons()
+        await interaction.response.edit_message(
+            content="接続先の変更をキャンセルしました。",
+            view=self,
+        )
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        self.disable_buttons()
+        if self.message:
+            with contextlib.suppress(discord.HTTPException):
+                await self.message.edit(content="接続確認がタイムアウトしました。", view=self)
 
 
 def build_bot(settings: Settings) -> OasisVoiceBot:
@@ -88,6 +185,18 @@ def build_bot(settings: Settings) -> OasisVoiceBot:
                 SpeechItem(text, provider, state.voice)
             )
 
+    @bot.event
+    async def on_voice_state_update(
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        if not bot.user or member.id != bot.user.id:
+            return
+        if before.channel is not None and after.channel is None:
+            logger.info("external voice disconnect detected (guild=%s)", member.guild.id)
+            await bot.stop_guild(member.guild.id)
+
     @bot.tree.command(name="join", description="現在のボイスチャンネルに参加して読み上げを開始")
     async def join(interaction: discord.Interaction) -> None:
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
@@ -100,10 +209,40 @@ def build_bot(settings: Settings) -> OasisVoiceBot:
             )
             return
         voice_client = interaction.guild.voice_client
-        if voice_client:
-            await voice_client.move_to(channel)
-        else:
-            voice_client = await channel.connect()
+        if voice_client and voice_client.channel == channel:
+            bot.player_for(interaction.guild.id).attach(voice_client)
+            bot.state_for(interaction.guild.id).text_channel_id = interaction.channel_id
+            await interaction.response.send_message(
+                f"すでに {channel.mention} に接続しています。"
+                "このチャンネルを読み上げ対象に設定しました。",
+                ephemeral=True,
+            )
+            return
+
+        if voice_client and voice_client.channel:
+            current_channel = voice_client.channel
+            can_view = current_channel.permissions_for(interaction.user).view_channel
+            current_name = current_channel.mention if can_view else "アクセスなし"
+            view = JoinConfirmationView(
+                bot=bot,
+                requester_id=interaction.user.id,
+                guild_id=interaction.guild.id,
+                target_channel=channel,
+                text_channel_id=interaction.channel_id,
+            )
+            await interaction.response.send_message(
+                "Botはすでに別のボイスチャンネルで使用中です。\n"
+                f"現在の接続先: {current_name}\n"
+                f"接続人数: **{len(current_channel.members)}人**\n"
+                f"新しい接続先: {channel.mention}\n\n"
+                "現在の読み上げを終了して接続先を変更しますか？",
+                view=view,
+                ephemeral=True,
+            )
+            view.message = await interaction.original_response()
+            return
+
+        voice_client = await channel.connect()
         bot.player_for(interaction.guild.id).attach(voice_client)
         bot.state_for(interaction.guild.id).text_channel_id = interaction.channel_id
         await interaction.response.send_message(
@@ -114,9 +253,7 @@ def build_bot(settings: Settings) -> OasisVoiceBot:
     async def leave(interaction: discord.Interaction) -> None:
         if not interaction.guild:
             return
-        await bot.player_for(interaction.guild.id).close()
-        bot.players.pop(interaction.guild.id, None)
-        bot.states.pop(interaction.guild.id, None)
+        await bot.stop_guild(interaction.guild.id)
         await interaction.response.send_message("読み上げを終了しました。")
 
     @bot.tree.command(name="skip", description="再生中の読み上げをスキップ")

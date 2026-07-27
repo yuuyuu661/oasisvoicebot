@@ -45,12 +45,24 @@ class GuildPlayer:
             return True
         return False
 
+    def clear_queue(self) -> None:
+        while True:
+            try:
+                self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                self.queue.task_done()
+
     async def close(self) -> None:
+        if self.voice_client and self.voice_client.is_playing():
+            self.voice_client.stop()
         if self._worker:
             self._worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._worker
             self._worker = None
+        self.clear_queue()
         if self.voice_client and self.voice_client.is_connected():
             await self.voice_client.disconnect(force=True)
         self.voice_client = None
